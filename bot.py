@@ -1,66 +1,112 @@
 import os
+import json
 import discord
 from discord.ext import commands
-import asyncpg
-import json
+import requests
+from flask import Flask
+import threading
 from cryptography.fernet import Fernet
 
-# ===== 環境変数 =====
-TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-SECRET_KEY = os.getenv("FERNET_KEY").encode()  # Renderで作成したFernetキー
+# ====== Flaskのダミーサーバー（Renderでタイムアウト防止） ======
+app = Flask('')
 
-fernet = Fernet(SECRET_KEY)
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = threading.Thread(target=run)
+    t.start()
+
+# ====== 暗号化設定 ======
+FERNET_KEY = os.getenv("FERNET_KEY")  # 事前に生成してRenderの環境変数に設定
+fernet = Fernet(FERNET_KEY)
+
+CONFIG_FILE = "data/config.json"
+
+# 初回起動時にファイルがなければ作成
+if not os.path.exists(CONFIG_FILE):
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    with open(CONFIG_FILE, "wb") as f:
+        encrypted_empty_data = fernet.encrypt(json.dumps({}).encode())
+        f.write(encrypted_empty_data)
+
+def load_config():
+    with open(CONFIG_FILE, "rb") as f:
+        encrypted_data = f.read()
+    decrypted_data = fernet.decrypt(encrypted_data).decode()
+    return json.loads(decrypted_data)
+
+def save_config(data):
+    with open(CONFIG_FILE, "wb") as f:
+        encrypted_data = fernet.encrypt(json.dumps(data).encode())
+        f.write(encrypted_data)
+
+# ====== Discord Bot設定 ======
+TOKEN = os.getenv("DISCORD_TOKEN")
+XUID_API_URL = "https://api.geysermc.org/v2/xbox/xuid/{gamertag}"
+GAMERTAG_API_URL = "https://api.geysermc.org/v2/xbox/gamertag/{xuid}"
 
 intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ===== PostgreSQL接続 =====
-async def pg_connect():
-    return await asyncpg.connect(DATABASE_URL)
-
-# ===== ギルドごとのロール保存 =====
-async def pg_set_role(guild_id: int, role_id: int):
-    conn = await pg_connect()
-    await conn.execute(
-        "INSERT INTO guild_roles (guild_id, role_id) VALUES ($1, $2) "
-        "ON CONFLICT (guild_id) DO UPDATE SET role_id = $2",
-        guild_id, role_id
-    )
-    await conn.close()
-
-async def pg_get_role(guild_id: int):
-    conn = await pg_connect()
-    row = await conn.fetchrow("SELECT role_id FROM guild_roles WHERE guild_id = $1", guild_id)
-    await conn.close()
-    return row["role_id"] if row else None
-
-# ===== Botイベント =====
 @bot.event
 async def on_ready():
     print(f"✅ Botがログインしました: {bot.user}")
 
+# 管理者がロールを設定するコマンド
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setrole(ctx, role: discord.Role):
-    await pg_set_role(ctx.guild.id, role.id)
-    await ctx.send(f"✅ このサーバーの認証用ロールを **{role.name}** に設定しました。")
+    config = load_config()
+    config[str(ctx.guild.id)] = role.id
+    save_config(config)
+    await ctx.send(f"✅ このサーバーの認証ロールを `{role.name}` に設定しました。")
 
-# ===== verifyコマンド例（JSON暗号化も可能） =====
+# 認証コマンド
 @bot.command()
 async def verify(ctx, gamertag: str):
-    role_id = await pg_get_role(ctx.guild.id)
+    config = load_config()
+    role_id = config.get(str(ctx.guild.id))
     if not role_id:
-        await ctx.send("⚠️ ロールが設定されていません。管理者に `!setrole` をお願いしてください。")
+        await ctx.send("⚠️ このサーバーでは認証ロールが設定されていません。管理者が `!setrole @ロール` で設定してください。")
         return
 
-    role = ctx.guild.get_role(role_id)
-    member = ctx.author
-    if role and member:
-        await member.add_roles(role)
-        await ctx.send(f"✅ {member.name} にロール **{role.name}** を付与しました。")
-    else:
-        await ctx.send("⚠️ ロールまたはメンバーが見つかりません。")
+    try:
+        xuid_response = requests.get(XUID_API_URL.format(gamertag=gamertag))
+        xuid_response.raise_for_status()
+        xuid = xuid_response.json().get("xuid")
+    except Exception:
+        await ctx.send("⚠️ XUID取得に失敗しました。")
+        return
 
+    if not xuid:
+        await ctx.send("⚠️ XUIDが見つかりません。")
+        return
+
+    try:
+        gamertag_response = requests.get(GAMERTAG_API_URL.format(xuid=xuid))
+        gamertag_response.raise_for_status()
+        returned_gamertag = gamertag_response.json().get("gamertag")
+    except Exception:
+        await ctx.send("⚠️ ユーザー確認に失敗しました。")
+        return
+
+    if gamertag.lower() == returned_gamertag.lower():
+        role = ctx.guild.get_role(role_id)
+        member = ctx.guild.get_member(ctx.author.id)
+        if role and member:
+            await member.add_roles(role)
+            await ctx.send(f"✅ {gamertag} さんを認証しました！")
+        else:
+            await ctx.send("⚠️ ロールまたはメンバーが見つかりません。")
+    else:
+        await ctx.send("❌ 認証に失敗しました。IDが一致しません。")
+
+# ====== 起動 ======
+keep_alive()
 bot.run(TOKEN)
