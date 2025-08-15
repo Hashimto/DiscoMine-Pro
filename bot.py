@@ -1,13 +1,13 @@
 import os
 import json
 import discord
-from discord.ext import commands
 import requests
-from flask import Flask
-import threading
+from discord.ext import commands
 from cryptography.fernet import Fernet
+import threading
+from flask import Flask
 
-# ====== Flaskのダミーサーバー（Renderでタイムアウト防止） ======
+# ===== Flaskダミーサーバー（Renderでタイムアウト防止） =====
 app = Flask('')
 
 @app.route('/')
@@ -21,31 +21,30 @@ def keep_alive():
     t = threading.Thread(target=run)
     t.start()
 
-# ====== 暗号化設定 ======
-FERNET_KEY = os.getenv("FERNET_KEY")  # 事前に生成してRenderの環境変数に設定
-fernet = Fernet(FERNET_KEY)
+# ===== 暗号化設定 =====
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+fernet = Fernet(ENCRYPTION_KEY.encode())
 
-CONFIG_FILE = "data/config.json"
+DATA_FILE = "server_roles.json"
 
-# 初回起動時にファイルがなければ作成
-if not os.path.exists(CONFIG_FILE):
-    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-    with open(CONFIG_FILE, "wb") as f:
-        encrypted_empty_data = fernet.encrypt(json.dumps({}).encode())
-        f.write(encrypted_empty_data)
-
-def load_config():
-    with open(CONFIG_FILE, "rb") as f:
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return {}
+    with open(DATA_FILE, "rb") as f:
         encrypted_data = f.read()
-    decrypted_data = fernet.decrypt(encrypted_data).decode()
-    return json.loads(decrypted_data)
+        if not encrypted_data:
+            return {}
+        decrypted_data = fernet.decrypt(encrypted_data).decode()
+        return json.loads(decrypted_data)
 
-def save_config(data):
-    with open(CONFIG_FILE, "wb") as f:
-        encrypted_data = fernet.encrypt(json.dumps(data).encode())
+def save_data(data):
+    encrypted_data = fernet.encrypt(json.dumps(data).encode())
+    with open(DATA_FILE, "wb") as f:
         f.write(encrypted_data)
 
-# ====== Discord Bot設定 ======
+server_roles = load_data()
+
+# ===== Discord Bot設定 =====
 TOKEN = os.getenv("DISCORD_TOKEN")
 XUID_API_URL = "https://api.geysermc.org/v2/xbox/xuid/{gamertag}"
 GAMERTAG_API_URL = "https://api.geysermc.org/v2/xbox/gamertag/{xuid}"
@@ -58,22 +57,29 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     print(f"✅ Botがログインしました: {bot.user}")
 
-# 管理者がロールを設定するコマンド
+# ===== サーバーごとのロール設定コマンド（管理者用） =====
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setrole(ctx, role: discord.Role):
-    config = load_config()
-    config[str(ctx.guild.id)] = role.id
-    save_config(config)
+    server_roles[str(ctx.guild.id)] = role.id
+    save_data(server_roles)
     await ctx.send(f"✅ このサーバーの認証ロールを `{role.name}` に設定しました。")
 
-# 認証コマンド
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def clearrole(ctx):
+    if str(ctx.guild.id) in server_roles:
+        del server_roles[str(ctx.guild.id)]
+        save_data(server_roles)
+        await ctx.send("🗑️ 認証ロール設定を削除しました。")
+    else:
+        await ctx.send("⚠️ このサーバーには認証ロール設定がありません。")
+
+# ===== DMでの認証コマンド =====
 @bot.command()
 async def verify(ctx, gamertag: str):
-    config = load_config()
-    role_id = config.get(str(ctx.guild.id))
-    if not role_id:
-        await ctx.send("⚠️ このサーバーでは認証ロールが設定されていません。管理者が `!setrole @ロール` で設定してください。")
+    if ctx.guild is not None:
+        await ctx.send("⚠️ このコマンドはDMで実行してください。")
         return
 
     try:
@@ -97,16 +103,19 @@ async def verify(ctx, gamertag: str):
         return
 
     if gamertag.lower() == returned_gamertag.lower():
-        role = ctx.guild.get_role(role_id)
-        member = ctx.guild.get_member(ctx.author.id)
-        if role and member:
-            await member.add_roles(role)
-            await ctx.send(f"✅ {gamertag} さんを認証しました！")
-        else:
-            await ctx.send("⚠️ ロールまたはメンバーが見つかりません。")
+        success_count = 0
+        for guild in bot.guilds:
+            role_id = server_roles.get(str(guild.id))
+            if role_id:
+                member = guild.get_member(ctx.author.id)
+                role = guild.get_role(role_id)
+                if member and role:
+                    await member.add_roles(role)
+                    success_count += 1
+
+        await ctx.send(f"✅ 認証成功！ {success_count} サーバーでロールを付与しました。")
     else:
         await ctx.send("❌ 認証に失敗しました。IDが一致しません。")
 
-# ====== 起動 ======
 keep_alive()
 bot.run(TOKEN)
