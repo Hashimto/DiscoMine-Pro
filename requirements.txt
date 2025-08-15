@@ -1,2 +1,5 @@
 discord.py==2.3.2
+requests
+flask
 cryptography
+psycopg2-binary
