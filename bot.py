@@ -1,121 +1,155 @@
 import os
-import json
 import discord
-import requests
+from discord import app_commands
 from discord.ext import commands
+import requests
+import json
 from cryptography.fernet import Fernet
-import threading
-from flask import Flask
+import psycopg2
 
-# ===== Flaskダミーサーバー（Renderでタイムアウト防止） =====
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is alive!"
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    t = threading.Thread(target=run)
-    t.start()
-
-# ===== 暗号化設定 =====
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
-fernet = Fernet(ENCRYPTION_KEY.encode())
-
-DATA_FILE = "server_roles.json"
-
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        return {}
-    with open(DATA_FILE, "rb") as f:
-        encrypted_data = f.read()
-        if not encrypted_data:
-            return {}
-        decrypted_data = fernet.decrypt(encrypted_data).decode()
-        return json.loads(decrypted_data)
-
-def save_data(data):
-    encrypted_data = fernet.encrypt(json.dumps(data).encode())
-    with open(DATA_FILE, "wb") as f:
-        f.write(encrypted_data)
-
-server_roles = load_data()
-
-# ===== Discord Bot設定 =====
+# ========== 環境変数 ==========
 TOKEN = os.getenv("DISCORD_TOKEN")
+FERNET_KEY = os.getenv("FERNET_KEY")  # 暗号化キー
+DATABASE_URL = os.getenv("DATABASE_URL")  # Supabase PostgreSQL URL
 XUID_API_URL = "https://api.geysermc.org/v2/xbox/xuid/{gamertag}"
 GAMERTAG_API_URL = "https://api.geysermc.org/v2/xbox/gamertag/{xuid}"
 
+# ========== 暗号化ユーティリティ ==========
+fernet = Fernet(FERNET_KEY)
+
+def encrypt_data(data: dict) -> str:
+    return fernet.encrypt(json.dumps(data).encode()).decode()
+
+def decrypt_data(data: str) -> dict:
+    try:
+        return json.loads(fernet.decrypt(data.encode()).decode())
+    except Exception:
+        return {}
+
+# ========== データ永続化 ==========
+LOCAL_FILE = "server_roles.json"
+server_roles = {}  # { guild_id: {"role_id": 123, "channel_id": 456} }
+
+def load_data():
+    global server_roles
+    if os.path.exists(LOCAL_FILE):
+        with open(LOCAL_FILE, "r") as f:
+            encrypted = f.read().strip()
+            if encrypted:
+                server_roles = decrypt_data(encrypted)
+    else:
+        server_roles = {}
+
+def save_data():
+    with open(LOCAL_FILE, "w") as f:
+        f.write(encrypt_data(server_roles))
+
+    # PostgreSQLにもバックアップ
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS server_roles (
+                guild_id TEXT PRIMARY KEY,
+                data TEXT NOT NULL
+            );
+        """)
+        for gid, data in server_roles.items():
+            cur.execute("""
+                INSERT INTO server_roles (guild_id, data)
+                VALUES (%s, %s)
+                ON CONFLICT (guild_id)
+                DO UPDATE SET data = EXCLUDED.data;
+            """, (gid, json.dumps(data)))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print("⚠️ Supabase保存エラー:", e)
+
+# 初期ロード
+load_data()
+
+# ========== Bot設定 ==========
 intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
 
 @bot.event
 async def on_ready():
+    await tree.sync()
     print(f"✅ Botがログインしました: {bot.user}")
 
-# ===== サーバーごとのロール設定コマンド（管理者用） =====
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setrole(ctx, role: discord.Role):
-    server_roles[str(ctx.guild.id)] = role.id
-    save_data(server_roles)
-    await ctx.send(f"✅ このサーバーの認証ロールを `{role.name}` に設定しました。")
+# ========== コマンド ==========
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def clearrole(ctx):
-    if str(ctx.guild.id) in server_roles:
-        del server_roles[str(ctx.guild.id)]
-        save_data(server_roles)
-        await ctx.send("🗑️ 認証ロール設定を削除しました。")
-    else:
-        await ctx.send("⚠️ このサーバーには認証ロール設定がありません。")
+# ロール設定コマンド（管理者専用）
+@tree.command(name="ロール設定", description="認証に付与するロールを設定します（管理者専用）")
+@app_commands.checks.has_permissions(administrator=True)
+async def setrole(interaction: discord.Interaction, role: discord.Role):
+    guild_id = str(interaction.guild.id)
+    server_roles[guild_id] = {
+        "role_id": role.id,
+        "channel_id": interaction.channel.id
+    }
+    save_data()
+    await interaction.response.send_message(
+        f"✅ このサーバーの認証ロールを `{role.name}` に設定しました。\n"
+        f"認証専用チャンネル: {interaction.channel.mention}"
+    )
 
-# ===== DMでの認証コマンド =====
-@bot.command()
-async def verify(ctx, gamertag: str):
-    if ctx.guild is not None:
-        await ctx.send("⚠️ このコマンドはDMで実行してください。")
+# 認証コマンド
+@tree.command(name="認証", description="Minecraftのゲーマータグを使って認証します")
+async def verify(interaction: discord.Interaction, ゲーマータグ: str):
+    guild_id = str(interaction.guild.id)
+    settings = server_roles.get(guild_id)
+
+    # チャンネルチェック
+    if not settings or interaction.channel.id != settings["channel_id"]:
+        await interaction.response.send_message("⚠️ このチャンネルでは認証できません。", ephemeral=True)
         return
 
+    await interaction.response.defer(ephemeral=True)
+
+    # XUID取得
     try:
-        xuid_response = requests.get(XUID_API_URL.format(gamertag=gamertag))
+        xuid_response = requests.get(XUID_API_URL.format(gamertag=ゲーマータグ))
         xuid_response.raise_for_status()
         xuid = xuid_response.json().get("xuid")
     except Exception:
-        await ctx.send("⚠️ XUID取得に失敗しました。")
+        await interaction.followup.send("⚠️ XUID取得に失敗しました。")
         return
 
     if not xuid:
-        await ctx.send("⚠️ XUIDが見つかりません。")
+        await interaction.followup.send("⚠️ XUIDが見つかりません。")
         return
 
+    # Gamertag確認
     try:
         gamertag_response = requests.get(GAMERTAG_API_URL.format(xuid=xuid))
         gamertag_response.raise_for_status()
         returned_gamertag = gamertag_response.json().get("gamertag")
     except Exception:
-        await ctx.send("⚠️ ユーザー確認に失敗しました。")
+        await interaction.followup.send("⚠️ ユーザー確認に失敗しました。")
         return
 
-    if gamertag.lower() == returned_gamertag.lower():
-        success_count = 0
-        for guild in bot.guilds:
-            role_id = server_roles.get(str(guild.id))
-            if role_id:
-                member = guild.get_member(ctx.author.id)
-                role = guild.get_role(role_id)
-                if member and role:
-                    await member.add_roles(role)
-                    success_count += 1
-
-        await ctx.send(f"✅ 認証成功！ {success_count} サーバーでロールを付与しました。")
+    if ゲーマータグ.lower() == returned_gamertag.lower():
+        guild = interaction.guild
+        role = guild.get_role(settings["role_id"])
+        member = interaction.user
+        if role and member:
+            await member.add_roles(role)
+            await interaction.followup.send(f"✅ {ゲーマータグ} さんを認証しました！")
+        else:
+            await interaction.followup.send("⚠️ ロールまたはメンバーが見つかりません。")
     else:
-        await ctx.send("❌ 認証に失敗しました。IDが一致しません。")
+        await interaction.followup.send("❌ 認証に失敗しました。IDが一致しません。")
 
-keep_alive()
+# エラーハンドリング
+@setrole.error
+async def setrole_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        await interaction.response.send_message("⚠️ このコマンドを実行できるのは管理者のみです。", ephemeral=True)
+
+# =============================
 bot.run(TOKEN)
