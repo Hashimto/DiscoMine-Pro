@@ -1,155 +1,142 @@
 import os
+import json
+import threading
+from datetime import datetime
+
 import discord
 from discord import app_commands
 from discord.ext import commands
-import requests
-import json
+
+from flask import Flask
+
+from supabase import create_client, Client
 from cryptography.fernet import Fernet
-import psycopg2
 
-# ========== 環境変数 ==========
-TOKEN = os.getenv("DISCORD_TOKEN")
-FERNET_KEY = os.getenv("FERNET_KEY")  # 暗号化キー
-DATABASE_URL = os.getenv("DATABASE_URL")  # Supabase PostgreSQL URL
-XUID_API_URL = "https://api.geysermc.org/v2/xbox/xuid/{gamertag}"
-GAMERTAG_API_URL = "https://api.geysermc.org/v2/xbox/gamertag/{xuid}"
+# ==============================
+# Flask (Render の Web Service 用ダミーサーバー)
+# ==============================
+app = Flask(__name__)
 
-# ========== 暗号化ユーティリティ ==========
-fernet = Fernet(FERNET_KEY)
+@app.route("/")
+def home():
+    return "Bot is running!"
 
-def encrypt_data(data: dict) -> str:
-    return fernet.encrypt(json.dumps(data).encode()).decode()
+def run_flask():
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
-def decrypt_data(data: str) -> dict:
-    try:
-        return json.loads(fernet.decrypt(data.encode()).decode())
-    except Exception:
-        return {}
+# ==============================
+# Supabase 接続
+# ==============================
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# ========== データ永続化 ==========
-LOCAL_FILE = "server_roles.json"
-server_roles = {}  # { guild_id: {"role_id": 123, "channel_id": 456} }
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def load_data():
-    global server_roles
-    if os.path.exists(LOCAL_FILE):
-        with open(LOCAL_FILE, "r") as f:
-            encrypted = f.read().strip()
-            if encrypted:
-                server_roles = decrypt_data(encrypted)
-    else:
-        server_roles = {}
+# ==============================
+# 暗号化キー（環境変数から取得）
+# ==============================
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+if not ENCRYPTION_KEY:
+    raise ValueError("ENCRYPTION_KEY が設定されていません！")
 
-def save_data():
-    with open(LOCAL_FILE, "w") as f:
-        f.write(encrypt_data(server_roles))
+fernet = Fernet(ENCRYPTION_KEY.encode())
 
-    # PostgreSQLにもバックアップ
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS server_roles (
-                guild_id TEXT PRIMARY KEY,
-                data TEXT NOT NULL
-            );
-        """)
-        for gid, data in server_roles.items():
-            cur.execute("""
-                INSERT INTO server_roles (guild_id, data)
-                VALUES (%s, %s)
-                ON CONFLICT (guild_id)
-                DO UPDATE SET data = EXCLUDED.data;
-            """, (gid, json.dumps(data)))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print("⚠️ Supabase保存エラー:", e)
+def encrypt(value: str) -> str:
+    return fernet.encrypt(value.encode()).decode()
 
-# 初期ロード
-load_data()
+def decrypt(value: str) -> str:
+    return fernet.decrypt(value.encode()).decode()
 
-# ========== Bot設定 ==========
+# ==============================
+# Discord Bot 設定
+# ==============================
 intents = discord.Intents.default()
+intents.guilds = True
 intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
+intents.message_content = False
 
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ==============================
+# DB 保存/取得関数
+# ==============================
+def save_guild_config(guild_id: int, channel_id: int, role_id: int):
+    encrypted_channel = encrypt(str(channel_id))
+    encrypted_role = encrypt(str(role_id))
+    created_at = datetime.utcnow().isoformat()
+
+    supabase.table("guild_configs").upsert({
+        "guild_id": str(guild_id),
+        "channel_id": encrypted_channel,
+        "role_id": encrypted_role,
+        "created_at": created_at
+    }).execute()
+
+def get_guild_config(guild_id: int):
+    res = supabase.table("guild_configs").select("*").eq("guild_id", str(guild_id)).execute()
+    if res.data:
+        data = res.data[0]
+        return {
+            "channel_id": int(decrypt(data["channel_id"])),
+            "role_id": int(decrypt(data["role_id"]))
+        }
+    return None
+
+# ==============================
+# スラッシュコマンド
+# ==============================
 @bot.event
 async def on_ready():
-    await tree.sync()
-    print(f"✅ Botがログインしました: {bot.user}")
+    try:
+        synced = await bot.tree.sync()
+        print(f"✅ {len(synced)} コマンドを同期しました")
+    except Exception as e:
+        print(f"❌ コマンド同期失敗: {e}")
 
-# ========== コマンド ==========
+    print(f"✅ ログイン成功: {bot.user}")
 
-# ロール設定コマンド（管理者専用）
-@tree.command(name="ロール設定", description="認証に付与するロールを設定します（管理者専用）")
+# 設定コマンド（管理者のみ）
+@bot.tree.command(name="設定", description="認証用チャンネルとロールを設定します（管理者専用）")
+@app_commands.describe(
+    channel="認証専用チャンネル",
+    role="認証成功時に付与するロール"
+)
 @app_commands.checks.has_permissions(administrator=True)
-async def setrole(interaction: discord.Interaction, role: discord.Role):
-    guild_id = str(interaction.guild.id)
-    server_roles[guild_id] = {
-        "role_id": role.id,
-        "channel_id": interaction.channel.id
-    }
-    save_data()
-    await interaction.response.send_message(
-        f"✅ このサーバーの認証ロールを `{role.name}` に設定しました。\n"
-        f"認証専用チャンネル: {interaction.channel.mention}"
-    )
+async def 設定(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
+    save_guild_config(interaction.guild.id, channel.id, role.id)
+    await interaction.response.send_message(f"✅ 認証チャンネルを {channel.mention}、ロールを {role.name} に設定しました！", ephemeral=True)
 
-# 認証コマンド
-@tree.command(name="認証", description="Minecraftのゲーマータグを使って認証します")
-async def verify(interaction: discord.Interaction, ゲーマータグ: str):
-    guild_id = str(interaction.guild.id)
-    settings = server_roles.get(guild_id)
-
-    # チャンネルチェック
-    if not settings or interaction.channel.id != settings["channel_id"]:
-        await interaction.response.send_message("⚠️ このチャンネルでは認証できません。", ephemeral=True)
+# 認証コマンド（ユーザーが実行）
+@bot.tree.command(name="認証", description="サーバーの認証を行います")
+async def 認証(interaction: discord.Interaction):
+    config = get_guild_config(interaction.guild.id)
+    if not config:
+        await interaction.response.send_message("❌ サーバー管理者がまだ設定していません。", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
-
-    # XUID取得
-    try:
-        xuid_response = requests.get(XUID_API_URL.format(gamertag=ゲーマータグ))
-        xuid_response.raise_for_status()
-        xuid = xuid_response.json().get("xuid")
-    except Exception:
-        await interaction.followup.send("⚠️ XUID取得に失敗しました。")
+    # 認証専用チャンネル以外では実行禁止
+    if interaction.channel.id != config["channel_id"]:
+        await interaction.response.send_message("❌ 認証専用チャンネルで実行してください。", ephemeral=True)
         return
 
-    if not xuid:
-        await interaction.followup.send("⚠️ XUIDが見つかりません。")
-        return
+    # ロール付与
+    role = interaction.guild.get_role(config["role_id"])
+    if role:
+        await interaction.user.add_roles(role)
+        await interaction.response.send_message(f"✅ {interaction.user.mention} に {role.name} を付与しました！", ephemeral=True)
 
-    # Gamertag確認
-    try:
-        gamertag_response = requests.get(GAMERTAG_API_URL.format(xuid=xuid))
-        gamertag_response.raise_for_status()
-        returned_gamertag = gamertag_response.json().get("gamertag")
-    except Exception:
-        await interaction.followup.send("⚠️ ユーザー確認に失敗しました。")
-        return
-
-    if ゲーマータグ.lower() == returned_gamertag.lower():
-        guild = interaction.guild
-        role = guild.get_role(settings["role_id"])
-        member = interaction.user
-        if role and member:
-            await member.add_roles(role)
-            await interaction.followup.send(f"✅ {ゲーマータグ} さんを認証しました！")
-        else:
-            await interaction.followup.send("⚠️ ロールまたはメンバーが見つかりません。")
+        # 認証メッセージは削除（チャンネルをきれいに保つ）
+        try:
+            await interaction.channel.purge(limit=1, check=lambda m: m.id == interaction.id)
+        except Exception:
+            pass
     else:
-        await interaction.followup.send("❌ 認証に失敗しました。IDが一致しません。")
+        await interaction.response.send_message("❌ 設定されたロールが見つかりません。", ephemeral=True)
 
-# エラーハンドリング
-@setrole.error
-async def setrole_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.errors.MissingPermissions):
-        await interaction.response.send_message("⚠️ このコマンドを実行できるのは管理者のみです。", ephemeral=True)
-
-# =============================
-bot.run(TOKEN)
+# ==============================
+# 起動
+# ==============================
+if __name__ == "__main__":
+    threading.Thread(target=run_flask).start()
+    bot.run(os.getenv("DISCORD_TOKEN"))
