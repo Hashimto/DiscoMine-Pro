@@ -1,4 +1,4 @@
 discord.py==2.3.2
-requests
-cryptography
-psycopg2-binary
+Flask==3.0.3
+supabase==2.4.0
+cryptography==45.0.0
