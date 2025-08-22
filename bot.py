@@ -1,5 +1,6 @@
 import os
 import discord
+from discord import app_commands
 from discord.ext import commands
 from supabase import create_client, Client
 from flask import Flask
@@ -11,7 +12,7 @@ from cryptography.fernet import Fernet
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")  # 追加
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 
 # ==== Supabase クライアント ====
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -22,63 +23,81 @@ fernet = Fernet(ENCRYPTION_KEY.encode())
 # ==== Discord Bot ====
 intents = discord.Intents.default()
 intents.guilds = True
-intents.guild_messages = True
+intents.members = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree  # スラッシュコマンド用
 
 # ---- Bot 起動イベント ----
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    await tree.sync()
+    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id}) - Slash commands synced")
 
-# ---- 認証設定コマンド ----
-@bot.command(name="set_verify")
-@commands.has_permissions(administrator=True)
-async def set_verify(ctx, channel_id: int, role_id: int):
-    guild_id = ctx.guild.id
+# ---- 認証設定コマンド (/認証設定) ----
+@tree.command(name="認証設定", description="認証用のチャンネルとロールを設定します（管理者専用）")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_verify(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
+    guild_id = interaction.guild.id
 
     # データを暗号化して保存
     data = {
         "guild_id": str(guild_id),
-        "channel_id": fernet.encrypt(str(channel_id).encode()).decode(),
-        "role_id": fernet.encrypt(str(role_id).encode()).decode(),
+        "channel_id": fernet.encrypt(str(channel.id).encode()).decode(),
+        "role_id": fernet.encrypt(str(role.id).encode()).decode(),
         "created_at": datetime.utcnow().isoformat()
     }
 
     try:
         supabase.table("guild_settings").upsert(data).execute()
-        await ctx.send(f"✅ 認証設定を保存しました。\nChannel: <#{channel_id}> | Role: <@&{role_id}>")
+        await interaction.response.send_message(
+            f"✅ 認証設定を保存しました。\nチャンネル: {channel.mention} | ロール: {role.mention}",
+            ephemeral=True  # 他の人には見えない
+        )
     except Exception as e:
-        await ctx.send("❌ データ保存中にエラーが発生しました。")
+        await interaction.response.send_message("❌ データ保存中にエラーが発生しました。", ephemeral=True)
         print(f"Supabase Error: {e}")
 
-# ---- 認証コマンド ----
-@bot.command(name="verify")
-async def verify(ctx):
-    guild_id = str(ctx.guild.id)
-    user = ctx.author
+# ---- 認証コマンド (/認証) ----
+@tree.command(name="認証", description="サーバーで認証を受けます")
+async def verify(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    user = interaction.user
 
     try:
         res = supabase.table("guild_settings").select("*").eq("guild_id", guild_id).execute()
         if not res.data:
-            await ctx.send("❌ このサーバーでは認証設定がまだ行われていません。")
+            await interaction.response.send_message("❌ このサーバーでは認証設定がまだ行われていません。", ephemeral=True)
             return
 
         setting = res.data[0]
 
-        # 復号化
+        # 認証チャンネル制限
+        channel_id = int(fernet.decrypt(setting["channel_id"].encode()).decode())
+        if interaction.channel.id != channel_id:
+            await interaction.response.send_message("❌ このチャンネルでは認証できません。", ephemeral=True)
+            return
+
+        # ロール付与
         role_id = int(fernet.decrypt(setting["role_id"].encode()).decode())
-        role = ctx.guild.get_role(role_id)
+        role = interaction.guild.get_role(role_id)
 
         if role is None:
-            await ctx.send("❌ 設定されたロールが見つかりません。")
+            await interaction.response.send_message("❌ 設定されたロールが見つかりません。", ephemeral=True)
             return
 
         await user.add_roles(role)
-        await ctx.send(f"✅ {user.mention} さんを認証しました！")
+        await interaction.response.send_message(f"✅ {user.mention} さんを認証しました！", ephemeral=True)
+
+        # ユーザーが実行したメッセージは削除（ログ汚さない用）
+        try:
+            await interaction.channel.purge(limit=1, check=lambda m: m.author == user)
+        except Exception as e:
+            print(f"メッセージ削除エラー: {e}")
+
     except Exception as e:
-        await ctx.send("❌ 認証中にエラーが発生しました。")
+        await interaction.response.send_message("❌ 認証中にエラーが発生しました。", ephemeral=True)
         print(f"Verify Error: {e}")
 
 # ---- Flask (keep-alive 用) ----
