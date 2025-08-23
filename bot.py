@@ -84,16 +84,19 @@ async def verify(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     try:
-        # コマンドを tree に追加
+        tree.clear_commands(guild=None)  # 古い登録を削除
+
         tree.add_command(app_commands.Command(
             name="認証",
             description="サーバーで認証を受けます",
             callback=verify
         ))
 
-        # コマンド同期
-        await tree.sync()
-        print(f"✅ {bot.user} としてログインしました - {len(tree.get_commands())} 件のコマンドを同期しました")
+        synced = await tree.sync()
+        print(f"✅ {bot.user} としてログインしました")
+        print(f"✅ {len(synced)} 件のコマンドを同期しました")
+        for cmd in synced:
+            print(f" - {cmd.name}")
 
     except Exception as e:
         print(f"❌ on_ready error: {e}")
