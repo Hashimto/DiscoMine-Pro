@@ -36,28 +36,48 @@ async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id}) - Slash commands synced")
 
 # ---- 認証設定コマンド (/認証設定) ----
-@tree.command(name="認証設定", description="認証用のチャンネルとロールを設定します（管理者専用）")
-@app_commands.checks.has_permissions(administrator=True)
-async def set_verify(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
-    guild_id = interaction.guild.id
+import traceback
 
-    # データを暗号化して保存
-    data = {
-        "guild_id": str(guild_id),
-        "channel_id": fernet.encrypt(str(channel.id).encode()).decode(),
-        "role_id": fernet.encrypt(str(role.id).encode()).decode(),
-        "created_at": datetime.utcnow().isoformat()
-    }
+# ---- 認証コマンド (/認証) ----
+@tree.command(name="認証", description="サーバーで認証を受けます")
+async def verify(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    user = interaction.user
 
     try:
-        supabase.table("guild_settings").upsert(data).execute()
-        await interaction.response.send_message(
-            f"✅ 認証設定を保存しました。\nチャンネル: {channel.mention} | ロール: {role.mention}",
-            ephemeral=True  # 他の人には見えない
-        )
-    except Exception as e:
-        await interaction.response.send_message("❌ データ保存中にエラーが発生しました。", ephemeral=True)
-        print(f"Supabase Error: {e}")
+        res = supabase.table("guild_settings").select("*").eq("guild_id", guild_id).execute()
+        if not res.data:
+            await interaction.response.send_message("❌ このサーバーでは認証設定がまだ行われていません。", ephemeral=True)
+            return
+
+        setting = res.data[0]
+
+        # 認証チャンネル制限
+        channel_id = int(fernet.decrypt(setting["channel_id"].encode()).decode())
+        if interaction.channel.id != channel_id:
+            await interaction.response.send_message("❌ このチャンネルでは認証できません。", ephemeral=True)
+            return
+
+        # ロール付与
+        role_id = int(fernet.decrypt(setting["role_id"].encode()).decode())
+        role = interaction.guild.get_role(role_id)
+
+        if role is None:
+            await interaction.response.send_message("❌ 設定されたロールが見つかりません。", ephemeral=True)
+            return
+
+        await user.add_roles(role)
+        await interaction.response.send_message(f"✅ {user.mention} さんを認証しました！", ephemeral=True)
+
+        # purge は一旦コメントアウト（動作確認用）
+        # try:
+        #     await interaction.channel.purge(limit=1, check=lambda m: m.author == user)
+        # except Exception:
+        #     traceback.print_exc()
+
+    except Exception:
+        traceback.print_exc()
+        await interaction.response.send_message("❌ 認証中にエラーが発生しました。", ephemeral=True)
 
 # ---- 認証コマンド (/認証) ----
 @tree.command(name="認証", description="サーバーで認証を受けます")
