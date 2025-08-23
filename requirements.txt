@@ -1,1 +1,4 @@
-
+supabase
+discord.py
+flask
+cryptography
