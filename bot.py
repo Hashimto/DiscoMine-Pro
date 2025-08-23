@@ -126,10 +126,18 @@ async def on_ready():
     try:
         tree.clear_commands(guild=None)  # 古い登録を削除
 
+        # 認証コマンド
         tree.add_command(app_commands.Command(
             name="認証",
             description="サーバーで認証を受けます",
             callback=verify
+        ))
+
+        # 認証設定コマンド（管理者専用）
+        tree.add_command(app_commands.Command(
+            name="認証設定",
+            description="認証に使用するチャンネルとロールを設定します（管理者専用）",
+            callback=auth_setting
         ))
 
         synced = await tree.sync()
