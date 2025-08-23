@@ -2,3 +2,8 @@ supabase==2.4.0
 discord.py==2.4.0
 flask==3.0.3
 cryptography==42.0.8
+gotrue==2.9.1
+postgrest==0.16.11
+storage3==0.7.7
+realtime==1.0.6
+httpx>=0.27.0
