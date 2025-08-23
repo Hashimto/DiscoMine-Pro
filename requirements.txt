@@ -1,5 +1,5 @@
 supabase==2.4.0
-httpx==0.25.2 
+httpx==0.24.1
 discord.py==2.4.0
 flask==3.0.3
 cryptography==42.0.8
