@@ -81,38 +81,43 @@ async def verify(interaction: discord.Interaction):
 
 
 # ---- 認証設定コマンド ----
-@tree.command(name="認証設定", description="認証に使用するチャンネルとロールを設定します")
+@tree.command(name="認証設定", description="認証に使用するチャンネルとロールを設定します（管理者専用）")
 @app_commands.describe(channel="認証を行うチャンネル", role="認証後に付与するロール")
+@app_commands.checks.has_permissions(administrator=True)  # ✅ サーバー管理者だけ実行可能
 async def auth_setting(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
     guild_id = str(interaction.guild.id)
 
     try:
-        encrypted_channel_id = fernet.encrypt(str(channel.id).encode()).decode()
-        encrypted_role_id = fernet.encrypt(str(role.id).encode()).decode()
-
+        # 既存設定があるか確認
         res = supabase.table("guild_settings").select("*").eq("guild_id", guild_id).execute()
 
+        enc_channel = fernet.encrypt(str(channel.id).encode()).decode()
+        enc_role = fernet.encrypt(str(role.id).encode()).decode()
+
         if res.data:
+            # 更新
             supabase.table("guild_settings").update({
-                "channel_id": encrypted_channel_id,
-                "role_id": encrypted_role_id,
-                "created_at": datetime.utcnow().isoformat()
+                "channel_id": enc_channel,
+                "role_id": enc_role
             }).eq("guild_id", guild_id).execute()
-            msg = f"🔄 認証設定を更新しました\n- チャンネル: {channel.mention}\n- ロール: {role.mention}"
+            msg = "✅ 認証設定を更新しました！"
         else:
+            # 新規作成
             supabase.table("guild_settings").insert({
                 "guild_id": guild_id,
-                "channel_id": encrypted_channel_id,
-                "role_id": encrypted_role_id,
-                "created_at": datetime.utcnow().isoformat()
+                "channel_id": enc_channel,
+                "role_id": enc_role
             }).execute()
-            msg = f"✅ 認証設定を保存しました\n- チャンネル: {channel.mention}\n- ロール: {role.mention}"
+            msg = "✅ 認証設定を保存しました！"
 
-        await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.response.send_message(
+            f"{msg}\n📌 認証チャンネル: {channel.mention}\n📌 認証ロール: {role.mention}",
+            ephemeral=True
+        )
 
-    except Exception:
-        traceback.print_exc()
-        await interaction.response.send_message("❌ 認証設定中にエラーが発生しました。", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message("❌ 設定中にエラーが発生しました。", ephemeral=True)
+        print(f"認証設定エラー: {e}")
 
 
 # ---- Bot 起動イベント ----
