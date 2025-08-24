@@ -30,7 +30,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree  # スラッシュコマンド用
 
-# ---- 認証コマンドの処理 ----
+# ---- 認証コマンドの処理 (/認証) ----
 async def verify(interaction: discord.Interaction):
     guild_id = str(interaction.guild.id)
     user = interaction.user
@@ -80,69 +80,107 @@ async def verify(interaction: discord.Interaction):
         await interaction.response.send_message("❌ 認証中にエラーが発生しました。", ephemeral=True)
 
 
-# ---- 認証設定コマンド ----
-@tree.command(name="認証設定", description="認証に使用するチャンネルとロールを設定します（管理者専用）")
-@app_commands.describe(channel="認証を行うチャンネル", role="認証後に付与するロール")
-@app_commands.checks.has_permissions(administrator=True)  # ✅ サーバー管理者だけ実行可能
+# ---- 認証設定コマンド (/認証設定) ----
+@tree.command(name="認証設定", description="認証に使うチャンネルとロールを設定します（管理者専用）")
+@app_commands.checks.has_permissions(administrator=True)
 async def auth_setting(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
     guild_id = str(interaction.guild.id)
 
     try:
-        # 既存設定があるか確認
+        encrypted_channel_id = fernet.encrypt(str(channel.id).encode()).decode()
+        encrypted_role_id = fernet.encrypt(str(role.id).encode()).decode()
+
         res = supabase.table("guild_settings").select("*").eq("guild_id", guild_id).execute()
 
-        enc_channel = fernet.encrypt(str(channel.id).encode()).decode()
-        enc_role = fernet.encrypt(str(role.id).encode()).decode()
-
         if res.data:
-            # 更新
+            # すでに設定あり → 更新
             supabase.table("guild_settings").update({
-                "channel_id": enc_channel,
-                "role_id": enc_role
+                "channel_id": encrypted_channel_id,
+                "role_id": encrypted_role_id,
             }).eq("guild_id", guild_id).execute()
-            msg = "✅ 認証設定を更新しました！"
+            action = "更新"
         else:
-            # 新規作成
+            # 初回 → 保存
             supabase.table("guild_settings").insert({
                 "guild_id": guild_id,
-                "channel_id": enc_channel,
-                "role_id": enc_role
+                "channel_id": encrypted_channel_id,
+                "role_id": encrypted_role_id,
+                "created_at": datetime.utcnow().isoformat()
             }).execute()
-            msg = "✅ 認証設定を保存しました！"
+            action = "保存"
 
         await interaction.response.send_message(
-            f"{msg}\n📌 認証チャンネル: {channel.mention}\n📌 認証ロール: {role.mention}",
+            f"✅ 認証設定を{action}しました。\n"
+            f"- チャンネル: {channel.mention}\n"
+            f"- ロール: {role.mention}",
             ephemeral=True
         )
 
-    except Exception as e:
+        # メッセージ削除（エラーは握りつぶす）
+
+    except Exception:
+        traceback.print_exc()
         await interaction.response.send_message("❌ 設定中にエラーが発生しました。", ephemeral=True)
-        print(f"認証設定エラー: {e}")
+
+
+# ---- 認証設定確認コマンド (/認証設定確認) ----
+@tree.command(name="認証設定確認", description="現在の認証設定を確認します（管理者専用）")
+@app_commands.checks.has_permissions(administrator=True)
+async def check_auth_setting(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+
+    try:
+        res = supabase.table("guild_settings").select("*").eq("guild_id", guild_id).execute()
+
+        if not res.data:
+            await interaction.response.send_message("❌ このサーバーには認証設定が保存されていません。", ephemeral=True)
+            return
+
+        setting = res.data[0]
+        channel_id = int(fernet.decrypt(setting["channel_id"].encode()).decode())
+        role_id = int(fernet.decrypt(setting["role_id"].encode()).decode())
+
+        channel = interaction.guild.get_channel(channel_id)
+        role = interaction.guild.get_role(role_id)
+
+        await interaction.response.send_message(
+            f"📌 現在の認証設定:\n"
+            f"- チャンネル: {channel.mention if channel else '❌ 不明'}\n"
+            f"- ロール: {role.mention if role else '❌ 不明'}",
+            ephemeral=True
+        )
+
+    except Exception:
+        traceback.print_exc()
+        await interaction.response.send_message("❌ 設定確認中にエラーが発生しました。", ephemeral=True)
 
 
 # ---- Bot 起動イベント ----
 @bot.event
 async def on_ready():
     try:
-        tree.clear_commands(guild=None)  # 古い登録を削除
+        tree.clear_commands(guild=None)
 
-        # 認証コマンド
+        # 認証
         tree.add_command(app_commands.Command(
             name="認証",
             description="サーバーで認証を受けます",
             callback=verify
         ))
 
-        # 認証設定コマンド（管理者専用）
+        # 認証設定（管理者専用）
         tree.add_command(app_commands.Command(
             name="認証設定",
             description="認証に使用するチャンネルとロールを設定します（管理者専用）",
-            callback=auth_setting
+            callback=auth_setting,
+            options=[
+                app_commands.Argument(name="channel", description="認証用のチャンネル", type=discord.AppCommandOptionType.channel),
+                app_commands.Argument(name="role", description="認証時に付与するロール", type=discord.AppCommandOptionType.role)
+            ]
         ))
 
         synced = await tree.sync()
         print(f"✅ {bot.user} としてログインしました")
-        print(f"✅ {len(synced)} 件のコマンドを同期しました")
         for cmd in synced:
             print(f" - {cmd.name}")
 
