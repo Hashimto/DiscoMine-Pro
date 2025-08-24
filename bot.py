@@ -161,26 +161,18 @@ async def on_ready():
     try:
         tree.clear_commands(guild=None)
 
-        # 認証
+        # 認証コマンドだけ手動登録
         tree.add_command(app_commands.Command(
             name="認証",
             description="サーバーで認証を受けます",
             callback=verify
         ))
 
-        # 認証設定（管理者専用）
-        tree.add_command(app_commands.Command(
-            name="認証設定",
-            description="認証に使用するチャンネルとロールを設定します（管理者専用）",
-            callback=auth_setting,
-            options=[
-                app_commands.Argument(name="channel", description="認証用のチャンネル", type=discord.AppCommandOptionType.channel),
-                app_commands.Argument(name="role", description="認証時に付与するロール", type=discord.AppCommandOptionType.role)
-            ]
-        ))
+        # 他は @tree.command デコレータで登録済みなのでOK
 
         synced = await tree.sync()
         print(f"✅ {bot.user} としてログインしました")
+        print("✅ 同期されたコマンド:")
         for cmd in synced:
             print(f" - {cmd.name}")
 
