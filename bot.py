@@ -81,10 +81,13 @@ async def verify(interaction: discord.Interaction):
 
 
 # ---- 認証設定コマンド (/認証設定) ----
-@tree.command(name="認証設定", description="認証に使うチャンネルとロールを設定します（管理者専用）")
-@app_commands.checks.has_permissions(administrator=True)
 async def auth_setting(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
     guild_id = str(interaction.guild.id)
+
+    # 管理者チェック
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 管理者専用のコマンドです。", ephemeral=True)
+        return
 
     try:
         encrypted_channel_id = fernet.encrypt(str(channel.id).encode()).decode()
@@ -116,18 +119,19 @@ async def auth_setting(interaction: discord.Interaction, channel: discord.TextCh
             ephemeral=True
         )
 
-        # メッセージ削除（エラーは握りつぶす）
-
     except Exception:
         traceback.print_exc()
         await interaction.response.send_message("❌ 設定中にエラーが発生しました。", ephemeral=True)
 
 
 # ---- 認証設定確認コマンド (/認証設定確認) ----
-@tree.command(name="認証設定確認", description="現在の認証設定を確認します（管理者専用）")
-@app_commands.checks.has_permissions(administrator=True)
 async def check_auth_setting(interaction: discord.Interaction):
     guild_id = str(interaction.guild.id)
+
+    # 管理者チェック
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 管理者専用のコマンドです。", ephemeral=True)
+        return
 
     try:
         res = supabase.table("guild_settings").select("*").eq("guild_id", guild_id).execute()
@@ -161,18 +165,41 @@ async def on_ready():
     try:
         tree.clear_commands(guild=None)
 
-        # 認証コマンドだけ手動登録
+        # /認証
         tree.add_command(app_commands.Command(
             name="認証",
             description="サーバーで認証を受けます",
             callback=verify
         ))
 
-        # 他は @tree.command デコレータで登録済みなのでOK
+        # /認証設定
+        tree.add_command(app_commands.Command(
+            name="認証設定",
+            description="認証に使うチャンネルとロールを設定します（管理者専用）",
+            callback=auth_setting,
+            options=[
+                app_commands.Argument(
+                    name="channel",
+                    description="認証用のチャンネル",
+                    type=discord.AppCommandOptionType.channel
+                ),
+                app_commands.Argument(
+                    name="role",
+                    description="認証時に付与するロール",
+                    type=discord.AppCommandOptionType.role
+                )
+            ]
+        ))
+
+        # /認証設定確認
+        tree.add_command(app_commands.Command(
+            name="認証設定確認",
+            description="現在の認証設定を確認します（管理者専用）",
+            callback=check_auth_setting
+        ))
 
         synced = await tree.sync()
         print(f"✅ {bot.user} としてログインしました")
-        print("✅ 同期されたコマンド:")
         for cmd in synced:
             print(f" - {cmd.name}")
 
